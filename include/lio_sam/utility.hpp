@@ -152,6 +152,11 @@ public:
     float globalMapVisualizationPoseDensity;
     float globalMapVisualizationLeafSize;
 
+    // Color cloud
+    std::vector<std::string> cameraTopics;
+    std::string imageTopicLastName;
+    std::string cameraInfoTopicLastName;
+
     ParamServer(std::string node_name, const rclcpp::NodeOptions & options) : Node(node_name, options)
     {
         declare_parameter("pointCloudTopic", "points");
@@ -308,6 +313,14 @@ public:
         declare_parameter("globalMapVisualizationLeafSize", 1.0);
         get_parameter("globalMapVisualizationLeafSize", globalMapVisualizationLeafSize);
 
+        // Color Cloud
+        declare_parameter("cameraTopics", std::vector<std::string>());
+        get_parameter("cameraTopics", cameraTopics);
+        declare_parameter("imageTopicLastName", "image_raw");
+        get_parameter("imageTopicLastName", imageTopicLastName);
+        declare_parameter("cameraInfoTopicLastName", "camera_info");
+        get_parameter("cameraInfoTopicLastName", cameraInfoTopicLastName);
+
         usleep(100);
     }
 
@@ -346,6 +359,17 @@ public:
 
 
 sensor_msgs::msg::PointCloud2 publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub, pcl::PointCloud<PointType>::Ptr thisCloud, rclcpp::Time thisStamp, std::string thisFrame)
+{
+    sensor_msgs::msg::PointCloud2 tempCloud;
+    pcl::toROSMsg(*thisCloud, tempCloud);
+    tempCloud.header.stamp = thisStamp;
+    tempCloud.header.frame_id = thisFrame;
+    if (thisPub->get_subscription_count() != 0)
+        thisPub->publish(tempCloud);
+    return tempCloud;
+}
+
+sensor_msgs::msg::PointCloud2 publishCloud(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr thisPub, pcl::PointCloud<pcl::PointXYZRGB>::Ptr thisCloud, rclcpp::Time thisStamp, std::string thisFrame)
 {
     sensor_msgs::msg::PointCloud2 tempCloud;
     pcl::toROSMsg(*thisCloud, tempCloud);

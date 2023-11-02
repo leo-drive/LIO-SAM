@@ -1,4 +1,11 @@
 #include "utility.hpp"
+#include "Camera.hpp"
+#include "TransformeProvider.hpp"
+#include "PointCloudType.hpp"
+
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+
 #include "lio_sam/msg/cloud_info.hpp"
 #include "lio_sam/srv/save_map.hpp"
 #include <gtsam/geometry/Rot3.h>
@@ -80,18 +87,21 @@ public:
     std::deque<nav_msgs::msg::Odometry> gpsQueue;
     lio_sam::msg::CloudInfo cloudInfo;
 
-    vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames;
-    vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;
+    vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> cornerCloudKeyFrames;
+    vector<pcl::PointCloud<pcl::PointXYZRGB>::Ptr> surfCloudKeyFrames;
     
     pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D;
     pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D;
     pcl::PointCloud<PointType>::Ptr copy_cloudKeyPoses3D;
     pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D;
 
-    pcl::PointCloud<PointType>::Ptr laserCloudCornerLast; // corner feature set from odoOptimization
-    pcl::PointCloud<PointType>::Ptr laserCloudSurfLast; // surf feature set from odoOptimization
-    pcl::PointCloud<PointType>::Ptr laserCloudCornerLastDS; // downsampled corner feature set from odoOptimization
-    pcl::PointCloud<PointType>::Ptr laserCloudSurfLastDS; // downsampled surf feature set from odoOptimization
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudCornerLast; // corner feature set from odoOptimization
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudSurfLast; // surf feature set from odoOptimization
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudCornerLastDS; // downsampled corner feature set from odoOptimization
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudSurfLastDS; // downsampled surf feature set from odoOptimization
+
+//    pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudCornerLastRGB; // downsampled rgb corner feature
+//    pcl::PointCloud<pcl::PointXYZRGB>::Ptr laserCloudSurfLastRGB; // downsampled rgb surf feature
 
     pcl::PointCloud<PointType>::Ptr laserCloudOri;
     pcl::PointCloud<PointType>::Ptr coeffSel;
@@ -119,6 +129,9 @@ public:
     pcl::VoxelGrid<PointType> downSizeFilterSurf;
     pcl::VoxelGrid<PointType> downSizeFilterICP;
     pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
+
+    pcl::VoxelGrid<pcl::PointXYZRGB> downSizeFilterCornerRGB;
+    pcl::VoxelGrid<pcl::PointXYZRGB> downSizeFilterSurfRGB;
 
     rclcpp::Time timeLaserInfoStamp;
     double timeLaserInfoCur;
@@ -150,6 +163,37 @@ public:
     Eigen::Affine3f incrementalOdometryAffineBack;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> br;
+
+    // Color Map
+    std::map<std::string, color_point_cloud::CameraTypePtr> camera_type_stdmap_;
+    std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subscribers_;
+    std::vector<rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr> camera_info_subscribers_;
+
+    color_point_cloud::TransformProviderConstPtr transform_provider_ptr_;
+
+    rclcpp::TimerBase::SharedPtr camera_timer_;
+
+    void camera_callback() {
+        std::for_each(camera_type_stdmap_.begin(), camera_type_stdmap_.end(),
+                      [this](const std::pair<std::string, color_point_cloud::CameraTypePtr> &pair) {
+                          if (pair.second->get_image_msg() == nullptr || pair.second->get_camera_info() == nullptr) {
+                              return;
+                          }
+                          if (!pair.second->is_info_initialized()) {
+                              RCLCPP_INFO(this->get_logger(), "Camera info is setting: %s", pair.first.c_str());
+                              pair.second->set_camera_utils(pair.second->get_camera_info());
+                          }
+                          if (!pair.second->is_transform_initialized() && pair.second->is_info_initialized()) {
+                              std::optional<geometry_msgs::msg::TransformStamped> transform = (*transform_provider_ptr_)(
+                                      pair.second->get_camera_frame_id(), lidarFrame);
+                              if (!transform.has_value()) {
+                                  return;
+                              }
+                              pair.second->set_lidar_to_camera_matrix(transform.value());
+                              pair.second->set_lidar_to_camera_projection_matrix();
+                          }
+                      });
+    }
 
     mapOptimization(const rclcpp::NodeOptions & options) : ParamServer("lio_sam_mapOptimization", options)
     {
@@ -191,11 +235,11 @@ public:
             pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
             pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
             // extract global point cloud map
-            pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
-            pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalCornerCloud(new pcl::PointCloud<pcl::PointXYZRGB>());
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalCornerCloudDS(new pcl::PointCloud<pcl::PointXYZRGB>());
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalSurfCloud(new pcl::PointCloud<pcl::PointXYZRGB>());
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalSurfCloudDS(new pcl::PointCloud<pcl::PointXYZRGB>());
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalMapCloud(new pcl::PointCloud<pcl::PointXYZRGB>());
             for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++) 
             {
                 *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
@@ -206,14 +250,14 @@ public:
             {
                cout << "\n\nSave resolution: " << req->resolution << endl;
                // down-sample and save corner cloud
-               downSizeFilterCorner.setInputCloud(globalCornerCloud);
-               downSizeFilterCorner.setLeafSize(req->resolution, req->resolution, req->resolution);
-               downSizeFilterCorner.filter(*globalCornerCloudDS);
+               downSizeFilterCornerRGB.setInputCloud(globalCornerCloud);
+               downSizeFilterCornerRGB.setLeafSize(req->resolution, req->resolution, req->resolution);
+               downSizeFilterCornerRGB.filter(*globalCornerCloudDS);
                pcl::io::savePCDFileBinary(saveMapDirectory + "/CornerMap.pcd", *globalCornerCloudDS);
                // down-sample and save surf cloud
-               downSizeFilterSurf.setInputCloud(globalSurfCloud);
-               downSizeFilterSurf.setLeafSize(req->resolution, req->resolution, req->resolution);
-               downSizeFilterSurf.filter(*globalSurfCloudDS);
+               downSizeFilterSurfRGB.setInputCloud(globalSurfCloud);
+               downSizeFilterSurfRGB.setLeafSize(req->resolution, req->resolution, req->resolution);
+               downSizeFilterSurfRGB.filter(*globalSurfCloudDS);
                pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloudDS);
             }
             else
@@ -249,6 +293,40 @@ public:
         downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
+        // Color Map
+        downSizeFilterCornerRGB.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
+        downSizeFilterSurfRGB.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+
+        // Color Map
+        for (const auto &camera_topic : cameraTopics) {
+            std::string image_topic = camera_topic + imageTopicLastName;
+            std::string camera_info_topic = camera_topic + cameraInfoTopicLastName;
+
+            color_point_cloud::CameraTypePtr camera_type_ptr = std::make_shared<color_point_cloud::CameraType>(image_topic, camera_info_topic);
+            camera_type_stdmap_[camera_topic] = camera_type_ptr;
+
+            this->image_subscribers_.push_back(this->create_subscription<sensor_msgs::msg::Image>(
+                    image_topic, rclcpp::SensorDataQoS(),
+                    [this, image_topic, camera_topic](const sensor_msgs::msg::Image::ConstSharedPtr &msg) {
+//                         RCLCPP_INFO(this->get_logger(), "Received image on topic %s", camera_topic.c_str());
+                        camera_type_stdmap_[camera_topic]->set_image_msg(msg);
+                    }));
+
+            this->camera_info_subscribers_.push_back(this->create_subscription<sensor_msgs::msg::CameraInfo>(
+                    camera_info_topic, rclcpp::SensorDataQoS(), [this, camera_info_topic, camera_topic](
+                            const sensor_msgs::msg::CameraInfo::ConstSharedPtr &msg) {
+//                         RCLCPP_INFO(this->get_logger(), "Received camera_info on topic %s", camera_topic.c_str());
+                        camera_type_stdmap_[camera_topic]->set_camera_info(msg);
+                    }));
+        }
+
+        transform_provider_ptr_ = std::make_shared<color_point_cloud::TransformProvider>(this->get_clock());
+
+        const auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::duration<double>(0.1));
+        camera_timer_ = rclcpp::create_timer(this, this->get_clock(), period_ns,
+                                      std::bind(&mapOptimization::camera_callback, this));
+
         allocateMemory();
     }
 
@@ -262,10 +340,10 @@ public:
         kdtreeSurroundingKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
         kdtreeHistoryKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
 
-        laserCloudCornerLast.reset(new pcl::PointCloud<PointType>()); // corner feature set from odoOptimization
-        laserCloudSurfLast.reset(new pcl::PointCloud<PointType>()); // surf feature set from odoOptimization
-        laserCloudCornerLastDS.reset(new pcl::PointCloud<PointType>()); // downsampled corner featuer set from odoOptimization
-        laserCloudSurfLastDS.reset(new pcl::PointCloud<PointType>()); // downsampled surf featuer set from odoOptimization
+        laserCloudCornerLast.reset(new pcl::PointCloud<pcl::PointXYZRGB>()); // corner feature set from odoOptimization
+        laserCloudSurfLast.reset(new pcl::PointCloud<pcl::PointXYZRGB>()); // surf feature set from odoOptimization
+        laserCloudCornerLastDS.reset(new pcl::PointCloud<pcl::PointXYZRGB>()); // downsampled corner featuer set from odoOptimization
+        laserCloudSurfLastDS.reset(new pcl::PointCloud<pcl::PointXYZRGB>()); // downsampled surf featuer set from odoOptimization
 
         laserCloudOri.reset(new pcl::PointCloud<PointType>());
         coeffSel.reset(new pcl::PointCloud<PointType>());
@@ -303,8 +381,158 @@ public:
 
         // extract info and feature cloud
         cloudInfo = *msgIn;
-        pcl::fromROSMsg(msgIn->cloud_corner,  *laserCloudCornerLast);
-        pcl::fromROSMsg(msgIn->cloud_surface, *laserCloudSurfLast);
+
+        laserCloudCornerLast->clear();
+        laserCloudSurfLast->clear();
+
+        std::for_each(camera_type_stdmap_.begin(), camera_type_stdmap_.end(),
+                      [this, msgIn](const std::pair<std::string, color_point_cloud::CameraTypePtr> &pair) {
+                          if (pair.second->get_image_msg() == nullptr || pair.second->get_camera_info() == nullptr ||
+                              !pair.second->is_info_initialized() || !pair.second->is_transform_initialized()) {
+                              RCLCPP_INFO(this->get_logger(),
+                                          "Can't project camera: %s\n"
+                                          "Is image received: %s\n"
+                                          "Is camera info received: %s\n"
+                                          "Is lidar-camera transform received: %s\n"
+                                          "Is camera utils initialized: %s",
+                                          pair.first.c_str(),
+                                          pair.second->get_image_msg() != nullptr ? "true" : "false",
+                                          pair.second->get_camera_info() != nullptr ? "true" : "false",
+                                          pair.second->is_transform_initialized() ? "true" : "false",
+                                          pair.second->is_info_initialized() ? "true" : "false");
+                              return;
+                          }
+
+                          pair.second->set_cv_image(pair.second->get_image_msg());
+
+                          color_point_cloud::PointCloudConst cloud_corner{msgIn->cloud_corner};
+
+                          #pragma omp parallel for num_threads(numberOfCores)
+                          for (size_t i = 0; i < cloud_corner.getPointCount(); ++i) {
+                              color_point_cloud::Point point{cloud_corner.getCurrentPoint()};
+                              pcl::PointXYZRGB pointRGB;
+
+                              Eigen::Vector4d point4d(point.x, point.y, point.z, 1.0);
+
+                              Eigen::Vector3d point3d_transformed_camera =
+                                      pair.second->get_lidar_to_camera_projection_matrix() * point4d;
+
+                              Eigen::Vector2d point2d_transformed_camera = Eigen::Vector2d(
+                                      point3d_transformed_camera[0] / point3d_transformed_camera[2],
+                                      point3d_transformed_camera[1] / point3d_transformed_camera[2]);
+
+                              double x = point2d_transformed_camera[0];
+                              double y = point2d_transformed_camera[1];
+
+                              if (x < 0 || x > pair.second->get_image_width() || y < 0 ||
+                                  y > pair.second->get_image_height() ||
+                                  point3d_transformed_camera[2] < 0) {
+                                  // TODO: If you give 0 to r, g, b, it will be more matt when you visualize on CloudCompare.
+                                  // pointRGB.x = point.x;
+                                  // pointRGB.y = point.y;
+                                  // pointRGB.z = point.z;
+                                  // pointRGB.r = 0;
+                                  // pointRGB.g = 0;
+                                  // pointRGB.b = 0;
+                                  // pointRGB.rgb = 0;
+                              } else {
+                                  cv::Vec3d color = pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
+                                  cv::Scalar color_scalar(color[0], color[1], color[2]);
+
+                                  pointRGB.x = point.x;
+                                  pointRGB.y = point.y;
+                                  pointRGB.z = point.z;
+
+                                  if (pair.second->get_image_msg()->encoding == "rgb8") {
+                                      pointRGB.r = color[0];
+                                      pointRGB.g = color[1];
+                                      pointRGB.b = color[2];
+                                      uint32_t rgb = (uint32_t(color[0]) << 16 | uint32_t(color[1]) << 8 |
+                                                      uint32_t(color[2]));
+                                  } else if (pair.second->get_image_msg()->encoding == "bgr8") {
+                                      pointRGB.r = color[0];
+                                      pointRGB.g = color[1];
+                                      pointRGB.b = color[2];
+                                      uint32_t rgb = (uint32_t(color[2]) << 16 | uint32_t(color[1]) << 8 |
+                                                      uint32_t(color[0]));
+                                  } else {
+                                      pointRGB.r = color[0];
+                                      pointRGB.g = color[1];
+                                      pointRGB.b = color[2];
+                                      uint32_t rgb = (uint32_t(color[0]) << 16 | uint32_t(color[1]) << 8 |
+                                                      uint32_t(color[2]));
+                                  }
+                              }
+
+                              laserCloudCornerLast->push_back(pointRGB);
+                              cloud_corner.nextPoint();
+                          }
+
+                          color_point_cloud::PointCloudConst cloud_surface{msgIn->cloud_surface};
+
+                          #pragma omp parallel for num_threads(numberOfCores)
+                          for (size_t i = 0; i < cloud_surface.getPointCount(); ++i) {
+                              color_point_cloud::Point point{cloud_surface.getCurrentPoint()};
+                              pcl::PointXYZRGB pointRGB;
+
+                              Eigen::Vector4d point4d(point.x, point.y, point.z, 1.0);
+
+                              Eigen::Vector3d point3d_transformed_camera =
+                                      pair.second->get_lidar_to_camera_projection_matrix() * point4d;
+
+                              Eigen::Vector2d point2d_transformed_camera = Eigen::Vector2d(
+                                      point3d_transformed_camera[0] / point3d_transformed_camera[2],
+                                      point3d_transformed_camera[1] / point3d_transformed_camera[2]);
+
+                              double x = point2d_transformed_camera[0];
+                              double y = point2d_transformed_camera[1];
+
+                              if (x < 0 || x > pair.second->get_image_width() || y < 0 ||
+                                  y > pair.second->get_image_height() ||
+                                  point3d_transformed_camera[2] < 0) {
+                                  // TODO: If you give 0 to r, g, b, it will be more matt when you visualize on CloudCompare.
+                                  // pointRGB.x = point.x;
+                                  // pointRGB.y = point.y;
+                                  // pointRGB.z = point.z;
+                                  // pointRGB.r = 0;
+                                  // pointRGB.g = 0;
+                                  // pointRGB.b = 0;
+                                  // pointRGB.rgb = 0;
+                              } else {
+                                  cv::Vec3d color = pair.second->get_cv_image().at<cv::Vec3b>(cv::Point(x, y));
+                                  cv::Scalar color_scalar(color[0], color[1], color[2]);
+
+                                  pointRGB.x = point.x;
+                                  pointRGB.y = point.y;
+                                  pointRGB.z = point.z;
+
+                                  if (pair.second->get_image_msg()->encoding == "rgb8") {
+                                      pointRGB.r = color[0];
+                                      pointRGB.g = color[1];
+                                      pointRGB.b = color[2];
+                                      uint32_t rgb = (uint32_t(color[0]) << 16 | uint32_t(color[1]) << 8 |
+                                                      uint32_t(color[2]));
+                                  } else if (pair.second->get_image_msg()->encoding == "bgr8") {
+                                      pointRGB.r = color[0];
+                                      pointRGB.g = color[1];
+                                      pointRGB.b = color[2];
+                                      uint32_t rgb = (uint32_t(color[2]) << 16 | uint32_t(color[1]) << 8 |
+                                                      uint32_t(color[0]));
+                                  } else {
+                                      pointRGB.r = color[0];
+                                      pointRGB.g = color[1];
+                                      pointRGB.b = color[2];
+                                      uint32_t rgb = (uint32_t(color[0]) << 16 | uint32_t(color[1]) << 8 |
+                                                      uint32_t(color[2]));
+                                  }
+                              }
+                              laserCloudSurfLast->push_back(pointRGB);
+                              cloud_surface.nextPoint();
+                          }
+                      });
+
+        if (laserCloudCornerLast->empty() || laserCloudSurfLast->empty())
+            return;
 
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -365,6 +593,30 @@ public:
         return cloudOut;
     }
 
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr transformPointCloud(pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloudIn, PointTypePose* transformIn)
+    {
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloudOut(new pcl::PointCloud<pcl::PointXYZRGB>());
+
+        int cloudSize = cloudIn->size();
+        cloudOut->resize(cloudSize);
+
+        Eigen::Affine3f transCur = pcl::getTransformation(transformIn->x, transformIn->y, transformIn->z, transformIn->roll, transformIn->pitch, transformIn->yaw);
+
+        #pragma omp parallel for num_threads(numberOfCores)
+        for (int i = 0; i < cloudSize; ++i)
+        {
+            const auto &pointFrom = cloudIn->points[i];
+            cloudOut->points[i].x = transCur(0,0) * pointFrom.x + transCur(0,1) * pointFrom.y + transCur(0,2) * pointFrom.z + transCur(0,3);
+            cloudOut->points[i].y = transCur(1,0) * pointFrom.x + transCur(1,1) * pointFrom.y + transCur(1,2) * pointFrom.z + transCur(1,3);
+            cloudOut->points[i].z = transCur(2,0) * pointFrom.x + transCur(2,1) * pointFrom.y + transCur(2,2) * pointFrom.z + transCur(2,3);
+            cloudOut->points[i].r = pointFrom.r;
+            cloudOut->points[i].g = pointFrom.g;
+            cloudOut->points[i].b = pointFrom.b;
+            cloudOut->points[i].rgb = pointFrom.rgb;
+        }
+        return cloudOut;
+    }
+
     gtsam::Pose3 pclPointTogtsamPose3(PointTypePose thisPoint)
     {
         return gtsam::Pose3(gtsam::Rot3::RzRyRx(double(thisPoint.roll), double(thisPoint.pitch), double(thisPoint.yaw)),
@@ -415,21 +667,21 @@ public:
         unused = system((std::string("mkdir ") + savePCDDirectory).c_str());
         pcl::io::savePCDFileASCII(savePCDDirectory + "trajectory.pcd", *cloudKeyPoses3D);
         pcl::io::savePCDFileASCII(savePCDDirectory + "transformations.pcd", *cloudKeyPoses6D);
-        pcl::PointCloud<PointType>::Ptr globalCornerCloud(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalCornerCloudDS(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalSurfCloudDS(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalMapCloud(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalCornerCloud(new pcl::PointCloud<pcl::PointXYZRGB>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalCornerCloudDS(new pcl::PointCloud<pcl::PointXYZRGB>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalSurfCloud(new pcl::PointCloud<pcl::PointXYZRGB>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalSurfCloudDS(new pcl::PointCloud<pcl::PointXYZRGB>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalMapCloud(new pcl::PointCloud<pcl::PointXYZRGB>());
         for (int i = 0; i < (int)cloudKeyPoses3D->size(); i++) {
             *globalCornerCloud += *transformPointCloud(cornerCloudKeyFrames[i],  &cloudKeyPoses6D->points[i]);
             *globalSurfCloud   += *transformPointCloud(surfCloudKeyFrames[i],    &cloudKeyPoses6D->points[i]);
             cout << "\r" << std::flush << "Processing feature cloud " << i << " of " << cloudKeyPoses6D->size() << " ...";
         }
-        downSizeFilterCorner.setInputCloud(globalCornerCloud);
-        downSizeFilterCorner.filter(*globalCornerCloudDS);
+        downSizeFilterCornerRGB.setInputCloud(globalCornerCloud);
+        downSizeFilterCornerRGB.filter(*globalCornerCloudDS);
         pcl::io::savePCDFileASCII(savePCDDirectory + "cloudCorner.pcd", *globalCornerCloudDS);
-        downSizeFilterSurf.setInputCloud(globalSurfCloud);
-        downSizeFilterSurf.filter(*globalSurfCloudDS);
+        downSizeFilterSurfRGB.setInputCloud(globalSurfCloud);
+        downSizeFilterSurfRGB.filter(*globalSurfCloudDS);
         pcl::io::savePCDFileASCII(savePCDDirectory + "cloudSurf.pcd", *globalSurfCloudDS);
         *globalMapCloud += *globalCornerCloud;
         *globalMapCloud += *globalSurfCloud;
@@ -449,8 +701,8 @@ public:
         pcl::KdTreeFLANN<PointType>::Ptr kdtreeGlobalMap(new pcl::KdTreeFLANN<PointType>());;
         pcl::PointCloud<PointType>::Ptr globalMapKeyPoses(new pcl::PointCloud<PointType>());
         pcl::PointCloud<PointType>::Ptr globalMapKeyPosesDS(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalMapKeyFrames(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr globalMapKeyFramesDS(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalMapKeyFrames(new pcl::PointCloud<pcl::PointXYZRGB>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr globalMapKeyFramesDS(new pcl::PointCloud<pcl::PointXYZRGB>());
 
         // kd-tree to find near key frames to visualize
         std::vector<int> pointSearchIndGlobalMap;
@@ -483,7 +735,7 @@ public:
             *globalMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
         }
         // downsample visualized points
-        pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyFrames; // for global map visualization
+        pcl::VoxelGrid<pcl::PointXYZRGB> downSizeFilterGlobalMapKeyFrames; // for global map visualization
         downSizeFilterGlobalMapKeyFrames.setLeafSize(globalMapVisualizationLeafSize, globalMapVisualizationLeafSize, globalMapVisualizationLeafSize); // for global map visualization
         downSizeFilterGlobalMapKeyFrames.setInputCloud(globalMapKeyFrames);
         downSizeFilterGlobalMapKeyFrames.filter(*globalMapKeyFramesDS);
@@ -707,8 +959,14 @@ public:
             int keyNear = key + i;
             if (keyNear < 0 || keyNear >= cloudSize )
                 continue;
-            *nearKeyframes += *transformPointCloud(cornerCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]);
-            *nearKeyframes += *transformPointCloud(surfCloudKeyFrames[keyNear],   &copy_cloudKeyPoses6D->points[keyNear]);
+
+            pcl::PointCloud<PointType>::Ptr corner_temp(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr surf_temp(new pcl::PointCloud<PointType>());
+            pcl::copyPointCloud(*cornerCloudKeyFrames[keyNear], *corner_temp);
+            pcl::copyPointCloud(*surfCloudKeyFrames[keyNear], *surf_temp);
+
+            *nearKeyframes += *transformPointCloud(corner_temp, &copy_cloudKeyPoses6D->points[keyNear]);
+            *nearKeyframes += *transformPointCloud(surf_temp,   &copy_cloudKeyPoses6D->points[keyNear]);
         }
 
         if (nearKeyframes->empty())
@@ -916,8 +1174,13 @@ public:
                 *laserCloudSurfFromMap   += laserCloudMapContainer[thisKeyInd].second;
             } else {
                 // transformed cloud not available
-                pcl::PointCloud<PointType> laserCloudCornerTemp = *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
-                pcl::PointCloud<PointType> laserCloudSurfTemp = *transformPointCloud(surfCloudKeyFrames[thisKeyInd],    &cloudKeyPoses6D->points[thisKeyInd]);
+                pcl::PointCloud<PointType>::Ptr corner_temp(new pcl::PointCloud<PointType>());
+                pcl::PointCloud<PointType>::Ptr surf_temp(new pcl::PointCloud<PointType>());
+                pcl::copyPointCloud(*cornerCloudKeyFrames[thisKeyInd], *corner_temp);
+                pcl::copyPointCloud(*surfCloudKeyFrames[thisKeyInd], *surf_temp);
+
+                pcl::PointCloud<PointType> laserCloudCornerTemp = *transformPointCloud(corner_temp,  &cloudKeyPoses6D->points[thisKeyInd]);
+                pcl::PointCloud<PointType> laserCloudSurfTemp = *transformPointCloud(surf_temp,    &cloudKeyPoses6D->points[thisKeyInd]);
                 *laserCloudCornerFromMap += laserCloudCornerTemp;
                 *laserCloudSurfFromMap   += laserCloudSurfTemp;
                 laserCloudMapContainer[thisKeyInd] = make_pair(laserCloudCornerTemp, laserCloudSurfTemp);
@@ -958,13 +1221,13 @@ public:
     {
         // Downsample cloud from current scan
         laserCloudCornerLastDS->clear();
-        downSizeFilterCorner.setInputCloud(laserCloudCornerLast);
-        downSizeFilterCorner.filter(*laserCloudCornerLastDS);
+        downSizeFilterCornerRGB.setInputCloud(laserCloudCornerLast);
+        downSizeFilterCornerRGB.filter(*laserCloudCornerLastDS);
         laserCloudCornerLastDSNum = laserCloudCornerLastDS->size();
 
         laserCloudSurfLastDS->clear();
-        downSizeFilterSurf.setInputCloud(laserCloudSurfLast);
-        downSizeFilterSurf.filter(*laserCloudSurfLastDS);
+        downSizeFilterSurfRGB.setInputCloud(laserCloudSurfLast);
+        downSizeFilterSurfRGB.filter(*laserCloudSurfLastDS);
         laserCloudSurfLastDSNum = laserCloudSurfLastDS->size();
     }
 
@@ -984,7 +1247,10 @@ public:
             std::vector<int> pointSearchInd;
             std::vector<float> pointSearchSqDis;
 
-            pointOri = laserCloudCornerLastDS->points[i];
+            pointOri.x = laserCloudCornerLastDS->points[i].x;
+            pointOri.y = laserCloudCornerLastDS->points[i].y;
+            pointOri.z = laserCloudCornerLastDS->points[i].z;
+            pointOri.intensity = laserCloudCornerLastDS->points[i].rgb;
             pointAssociateToMap(&pointOri, &pointSel);
             kdtreeCornerFromMap->nearestKSearch(pointSel, 5, pointSearchInd, pointSearchSqDis);
 
@@ -1076,7 +1342,10 @@ public:
             std::vector<int> pointSearchInd;
             std::vector<float> pointSearchSqDis;
 
-            pointOri = laserCloudSurfLastDS->points[i];
+            pointOri.x = laserCloudSurfLastDS->points[i].x;
+            pointOri.y = laserCloudSurfLastDS->points[i].y;
+            pointOri.z = laserCloudSurfLastDS->points[i].z;
+            pointOri.intensity = laserCloudSurfLastDS->points[i].rgb;
             pointAssociateToMap(&pointOri, &pointSel); 
             kdtreeSurfFromMap->nearestKSearch(pointSel, 5, pointSearchInd, pointSearchSqDis);
 
@@ -1569,8 +1838,8 @@ public:
         transformTobeMapped[5] = latestEstimate.translation().z();
 
         // save all the received edge and surf points
-        pcl::PointCloud<PointType>::Ptr thisCornerKeyFrame(new pcl::PointCloud<PointType>());
-        pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr thisCornerKeyFrame(new pcl::PointCloud<pcl::PointXYZRGB>());
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr thisSurfKeyFrame(new pcl::PointCloud<pcl::PointXYZRGB>());
         pcl::copyPointCloud(*laserCloudCornerLastDS,  *thisCornerKeyFrame);
         pcl::copyPointCloud(*laserCloudSurfLastDS,    *thisSurfKeyFrame);
 
@@ -1639,7 +1908,7 @@ public:
         nav_msgs::msg::Odometry laserOdometryROS;
         laserOdometryROS.header.stamp = timeLaserInfoStamp;
         laserOdometryROS.header.frame_id = odometryFrame;
-        laserOdometryROS.child_frame_id = "odom_mapping";
+        laserOdometryROS.child_frame_id = "base_link";
         laserOdometryROS.pose.pose.position.x = transformTobeMapped[3];
         laserOdometryROS.pose.pose.position.y = transformTobeMapped[4];
         laserOdometryROS.pose.pose.position.z = transformTobeMapped[5];
@@ -1698,7 +1967,7 @@ public:
             }
             laserOdomIncremental.header.stamp = timeLaserInfoStamp;
             laserOdomIncremental.header.frame_id = odometryFrame;
-            laserOdomIncremental.child_frame_id = "odom_mapping";
+            laserOdomIncremental.child_frame_id = "base_link";
             laserOdomIncremental.pose.pose.position.x = x;
             laserOdomIncremental.pose.pose.position.y = y;
             laserOdomIncremental.pose.pose.position.z = z;
@@ -1726,7 +1995,7 @@ public:
         // publish registered key frame
         if (pubRecentKeyFrame->get_subscription_count() != 0)
         {
-            pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloudOut(new pcl::PointCloud<pcl::PointXYZRGB>());
             PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
             *cloudOut += *transformPointCloud(laserCloudCornerLastDS,  &thisPose6D);
             *cloudOut += *transformPointCloud(laserCloudSurfLastDS,    &thisPose6D);
